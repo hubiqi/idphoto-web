@@ -1,14 +1,25 @@
 /* AI 证件照 前端逻辑
  *
- * 前端可能被托管在与后端不同的域名上（GitHub Pages / Cloudflare Pages），
- * 所以 API 基址按以下顺序解析：
- *   1. URL 上的 ?api=https://xxx   （并记住到 localStorage）
- *   2. 同源 /api/health 探测（前端由后端自己托管时走这条）
- *   3. 远程配置（后端每次重启会把 cloudflared 隧道地址写进这个文件）
- *   4. localStorage 里上一次用过的地址
+ * 后端可能和前端不同域（GitHub Pages / Cloudflare Pages），API 基址按顺序静默解析：
+ *   1. URL 参数 ?api=https://...
+ *   2. 同源 /api/health          —— 前端由后端自己托管时走这条
+ *   3. localStorage 上次成功的地址
+ *   4. 远程配置 api.json（后端每次换隧道地址都会更新它）
+ *        4.1 raw.githubusercontent 直读仓库（最新）
+ *        4.2 GitHub Pages 同名文件（约 1 分钟延迟）
+ *        4.3 Cloudflare Pages 部署快照（最旧，仅作兜底）
+ *   5. 服务器原地址（HTTP）。HTTPS 页面会被浏览器按「混合内容」拦掉，
+ *      所以彻底连不上时会给一个整页跳转的备用入口链接。
+ *
+ * 界面上不展示任何服务器地址。
  */
 const $ = (s) => document.querySelector(s);
-const CONFIG_URL = 'https://raw.githubusercontent.com/hubiqi/idphoto-web/main/api.json';
+const DIRECT = 'http://158.178.244.142:8099';
+const CONFIGS = [
+  'https://raw.githubusercontent.com/hubiqi/idphoto-web/main/api.json',
+  'https://hubiqi.github.io/idphoto-web/api.json',
+  'https://hubiqi-idphoto.pages.dev/api.json',
+];
 let API = '';
 
 const state = { file: null, size: { name: '一寸', h: 413, w: 295 }, bg: 'ffffff',
@@ -26,64 +37,93 @@ const api = (p) => API.replace(/\/$/, '') + p;
 const norm = (u) => (u || '').trim().replace(/\/+$/, '');
 
 /* ---------- API 基址解析 ---------- */
-async function probe(base) {
+function withTimeout(ms) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 6000);
+  const timer = setTimeout(() => ctl.abort(), ms);
+  return { signal: ctl.signal, done: () => clearTimeout(timer) };
+}
+
+async function probe(base, ms = 5000) {
+  const t = withTimeout(ms);
   try {
-    const r = await fetch(base + '/api/health', { signal: ctl.signal, cache: 'no-store' });
+    const r = await fetch(base + '/api/health', { signal: t.signal, cache: 'no-store' });
     if (!r.ok) return false;
     const d = await r.json();
     return d && d.ok ? d : false;
   } catch (e) {
     return false;
   } finally {
-    clearTimeout(timer);
+    t.done();
   }
 }
 
-function setApi(base, silent) {
+function setApi(base) {
   API = norm(base);
   try { localStorage.setItem('idphoto_api', API); } catch (e) {}
-  $('#apiBase').value = API;
-  $('.note-api').textContent = API || '（同源）';
-  if (!silent) toast('已连接服务器：' + (API || location.origin));
+}
+
+async function fetchCfg(url, ms = 5000) {
+  const t = withTimeout(ms);
+  try {
+    const r = await fetch(url + '?t=' + Date.now(), { signal: t.signal, cache: 'no-store' });
+    if (!r.ok) return '';
+    const cfg = await r.json();
+    return cfg && cfg.api ? norm(cfg.api) : '';
+  } catch (e) {
+    return '';
+  } finally {
+    t.done();
+  }
+}
+
+const cfgList = () => Promise.all(CONFIGS.map((u) => fetchCfg(u)));
+
+/* 并行探所有候选地址，谁先通就用谁 */
+function firstOk(bases, budget = 7000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const uniq = [...new Set(bases.filter(Boolean))];
+    if (!uniq.length) return finish(false);
+    const timer = setTimeout(() => finish(false), budget);
+    let left = uniq.length;
+    uniq.forEach(async (b) => {
+      const h = await probe(b);
+      if (settled) return;
+      if (h) {
+        clearTimeout(timer);
+        setApi(b);
+        applyHealth(h);
+        return finish(true);
+      }
+      if (--left === 0) { clearTimeout(timer); finish(false); }
+    });
+  });
 }
 
 async function resolveApi() {
   const q = new URLSearchParams(location.search).get('api');
   if (q) {
-    API = norm(q);
-    const h = await probe(API);
-    if (h) { setApi(API); applyHealth(h); return; }
-    toast('指定的 API 地址不可用，继续自动查找…', true);
+    const h = await probe(norm(q));
+    if (h) { setApi(q); applyHealth(h); return true; }
   }
-  // 1) 同源
+  // 1) 同源（前端由后端自己托管时走这条，最快）
   let h = await probe('');
-  if (h) { setApi(''); applyHealth(h); return; }
-  // 2) 远程配置
-  for (let i = 0; i < 2; i++) {
-    try {
-      const r = await fetch(CONFIG_URL + '?t=' + Date.now(), { cache: 'no-store' });
-      if (r.ok) {
-        const cfg = await r.json();
-        if (cfg && cfg.api) {
-          const base = norm(cfg.api);
-          const hh = await probe(base);
-          if (hh) { setApi(base); applyHealth(hh); return; }
-        }
-      }
-    } catch (e) { /* 忽略，走兜底 */ }
-    if (i === 0) await new Promise(s => setTimeout(s, 1200));
-  }
-  // 3) 上次用过的
+  if (h) { setApi(''); applyHealth(h); return true; }
+
+  // 2) 上次成功的地址：立刻开始探，同时并行去拉配置
   let last = '';
   try { last = localStorage.getItem('idphoto_api') || ''; } catch (e) {}
-  if (last) {
-    const hh = await probe(last);
-    if (hh) { setApi(last); applyHealth(hh); return; }
+  const lastP = last && last !== DIRECT ? probe(last).then((r) => (r ? last : '')) : Promise.resolve('');
+  const cfgs = await cfgList();
+  const lastOk = await lastP;
+  if (lastOk) {
+    const hh = await probe(lastOk);
+    if (hh) { setApi(lastOk); applyHealth(hh); return true; }
   }
-  toast('暂时连不上证件照服务，稍后可点右上角「服务器」重试', true);
-  $('.note-api').textContent = '未连接';
+
+  // 3) 配置里的隧道地址 + 服务器原地址兜底
+  return firstOk([...cfgs, DIRECT], 7000);
 }
 
 function applyHealth(h) {
@@ -347,18 +387,19 @@ $('#dlall').onclick = async () => {
 
 /* ---------- 启动 ---------- */
 (async () => {
-  await resolveApi();
-  loadMeta();
+  const ok = await resolveApi();
+  if (ok) {
+    loadMeta();
+  } else {
+    $('#offline').hidden = false;
+    $('#fallback').href = DIRECT + '/';
+  }
 })();
 
-/* 服务器地址手动设置 */
-$('#apiSet').onclick = async () => {
-  const v = norm($('#apiBase').value);
-  if ($('#apiBase').value.trim() && !v.startsWith('http')) return toast('请输入 http(s):// 开头的地址', true);
-  const h = await probe(v);
-  if (!h) return toast('这个地址连不上', true);
-  setApi(v);
-  applyHealth(h);
-  loadMeta();
+$('#retry').onclick = async () => {
+  $('#offline').hidden = true;
+  toast('正在重连…');
+  const ok = await resolveApi();
+  if (ok) { loadMeta(); toast('已连接'); }
+  else { $('#offline').hidden = false; toast('还是连不上，稍后再试', true); }
 };
-$('.note-api') && ($('.note-api').onclick = (e) => { e.preventDefault(); $('#apiRow').hidden = !$('#apiRow').hidden; });

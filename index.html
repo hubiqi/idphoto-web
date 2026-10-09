@@ -93,6 +93,13 @@
   .spin{width:15px;height:15px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;
     display:inline-block;vertical-align:-2px;margin-right:8px;animation:sp .8s linear infinite}
   @keyframes sp{to{transform:rotate(360deg)}}
+
+  .card.off{border-color:#f0c9c9;background:#fff8f8}
+  .off-t{font-weight:600;color:#c0392b;margin-bottom:4px}
+  .off-s{font-size:13px;color:var(--muted);margin-bottom:10px}
+  .off-r{display:flex;gap:10px;flex-wrap:wrap}
+  .mini.ghost{background:#fff;color:#c0392b;border:1px solid #f0c9c9;text-decoration:none;
+    display:inline-flex;align-items:center;justify-content:center}
 </style>
 </head>
 <body>
@@ -176,15 +183,14 @@
   </section>
 
   <div class="note">照片会上传到服务器做抠图与裁切，处理完即丢弃，不落盘、不留存。</div>
-  <div class="note"><a href="#" class="note-api" style="color:#2f6bff">服务器：连接中…</a></div>
-  <div class="card" id="apiRow" hidden style="margin-top:10px">
-    <h2>服务器地址</h2>
-    <div class="custom" style="margin-top:0">
-      <label style="flex:1 1 200px">API 基址（留空表示同源）
-        <input id="apiBase" type="url" placeholder="https://xxxx.trycloudflare.com">
-      </label>
-      <button class="mini" id="apiSet">连接</button>
+  <div class="card off" id="offline" hidden>
+    <div class="off-t">暂时连不上证件照服务</div>
+    <div class="off-s">隧道可能正在重启，稍等片刻重试即可。</div>
+    <div class="off-r">
+      <button class="mini" id="retry">重试连接</button>
+      <a class="mini ghost" id="fallback" href="#">打开备用入口</a>
     </div>
+  
   </div>
 </div>
 <div class="toast" id="toast"></div>
