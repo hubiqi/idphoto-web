@@ -142,8 +142,13 @@ async function resolveApi() {
     if (hh) { setApi(lastOk); applyHealth(hh); return true; }
   }
 
-  // 3) 配置里的隧道地址 + 服务器原地址兜底
-  return firstOk([...cfgs, DIRECT], 7000);
+  // 3) 优先用配置里的隧道地址（HTTPS），原地址只在隧道全挂时兜底。
+  //    两者并行探测，所以兜底不会额外增加等待时间。
+  const directP = probe(DIRECT).then((r) => (r ? DIRECT : ''));
+  if (await firstOk(cfgs, 7000)) return true;
+  const d = await directP;
+  if (d) { setApi(d); return true; }
+  return false;
 }
 
 function applyHealth(h) {
@@ -189,6 +194,22 @@ async function loadMeta() {
       cbox.appendChild(b);
     });
     state.bg = d.colors[1].hex; state.bgName = d.colors[1].name;
+    // 抠图模型来自后端：只列出服务器上真的有权重文件的那些
+    const sel = $('#matting');
+    const LABEL = {
+      hivision_modnet: 'hivision_modnet（快，推荐）',
+      modnet_photographic_portrait_matting: 'MODNet 通用版（更细腻，稍慢）',
+      'rmbg-1.4': 'RMBG-1.4（写实人像）',
+    };
+    if (sel && d.matting_models && d.matting_models.length) {
+      sel.innerHTML = '';
+      d.matting_models.forEach((m) => {
+        const o = document.createElement('option');
+        o.value = m;
+        o.textContent = LABEL[m] || m;
+        sel.appendChild(o);
+      });
+    }
   } catch (e) {
     toast('尺寸表加载失败：' + e.message, true);
   }
@@ -249,7 +270,8 @@ $('#go').onclick = async () => {
     render(d);
     toast(`完成，用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
-    toast(e.message, true);
+    const msg = String(e.message || e);
+    toast(msg.length > 160 ? msg.slice(0, 160) + '…' : msg, true);
   } finally {
     clearInterval(tick);
     btn.disabled = false; btn.classList.remove('busy');
