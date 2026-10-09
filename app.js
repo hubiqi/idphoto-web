@@ -12,7 +12,7 @@ const CONFIG_URL = 'https://raw.githubusercontent.com/hubiqi/idphoto-web/main/ap
 let API = '';
 
 const state = { file: null, size: { name: '一寸', h: 413, w: 295 }, bg: 'ffffff',
-                bgName: '白色', results: [], idx: 0 };
+                bgName: '白色', data: {}, idx: 0, base: '' };
 
 const toast = (msg, isErr) => {
   const t = $('#toast');
@@ -107,6 +107,7 @@ async function loadMeta() {
       b.setAttribute('aria-pressed', i === 0 ? 'true' : 'false');
       b.onclick = () => {
         state.size = s;
+        state.upCache = null;
         [...box.children].forEach(c => c.setAttribute('aria-pressed', 'false'));
         b.setAttribute('aria-pressed', 'true');
         $('#cw').value = ''; $('#ch').value = '';
@@ -164,6 +165,7 @@ $('#useCustom').onclick = () => {
   const w = parseInt($('#cw').value, 10), h = parseInt($('#ch').value, 10);
   if (!w || !h || w < 60 || h < 60 || w > 3000 || h > 3000) return toast('请输入合理的宽高（60~3000px）', true);
   state.size = { name: `自定义${w}×${h}`, w, h };
+  state.upCache = null;
   [...$('#sizes').children].forEach(c => c.setAttribute('aria-pressed', 'false'));
   toast(`已选自定义尺寸 ${w}×${h}`);
 };
@@ -178,18 +180,7 @@ $('#go').onclick = async () => {
   btn.disabled = true; btn.classList.add('busy');
   btn.innerHTML = '<span class="spin"></span>正在生成…';
 
-  const fd = new FormData();
-  fd.append('image', state.file);
-  fd.append('h', state.size.h);
-  fd.append('w', state.size.w);
-  fd.append('bg', state.bg);
-  fd.append('face_align', $('#align').checked ? 1 : 0);
-  fd.append('whitening', $('#whitening').value);
-  fd.append('brightness', $('#brightness').value);
-  fd.append('contrast', $('#contrast').value);
-  fd.append('saturation', $('#saturation').value);
-  fd.append('sharpen', $('#sharpen').value);
-  fd.append('matting_model', $('#matting').value);
+  const fd = await buildForm('standard,hd');
 
   try {
     const r = await fetch(api('/api/generate'), { method: 'POST', body: fd });
@@ -207,40 +198,132 @@ $('#go').onclick = async () => {
 };
 
 /* ---------- 结果 ---------- */
-function render(d) {
-  const base = `${state.size.name}_${state.bgName}`;
-  const items = [{ k: 'standard', n: '标准照' }];
-  if (d.hd) items.push({ k: 'hd', n: '高清照' });
-  if (d.layout) items.push({ k: 'layout', n: '六寸排版' });
-  if (d.transparent) items.push({ k: 'transparent', n: '透明底 PNG' });
-  state.results = items.filter(i => d[i.k]).map(i => ({ ...i, data: d[i.k], base }));
-  state.idx = 0;
+const TABS = [
+  { k: 'standard', n: '标准照', ext: 'jpg' },
+  { k: 'hd', n: '高清照', ext: 'jpg' },
+  { k: 'layout', n: '六寸排版', ext: 'jpg' },
+  { k: 'transparent', n: '透明底 PNG', ext: 'png' },
+];
 
-  const tabs = $('#tabs');
-  tabs.innerHTML = '';
-  state.results.forEach((it, i) => {
-    const b = document.createElement('button');
-    b.className = 'tab';
-    b.textContent = it.n;
-    b.setAttribute('aria-pressed', i === 0 ? 'true' : 'false');
-    b.onclick = () => { state.idx = i; show(); };
-    tabs.appendChild(b);
-  });
+/* 手机直出照片动辄 3-8MB，直接上传要几十秒。先在浏览器里等比压到够用的尺寸：
+ * 输出最大也就 2 倍目标尺寸，压过头不影响成品，能省掉 90% 的上传时间。
+ * 顺带一个好处：canvas 会把 EXIF 旋转「烧」进像素，后端不会再遇到侧躺照片。 */
+async function prepareUpload() {
+  const target = Math.min(2400, Math.max(1000, Math.round(Math.max(state.size.h, state.size.w) * 2.2)));
+  const key = `${state.file.name}|${state.file.size}|${target}`;
+  if (state.upCache && state.upCache.key === key) return state.upCache.blob;
+
+  const url = URL.createObjectURL(state.file);
+  let img;
+  try {
+    img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error('图片解码失败'));
+      i.src = url;
+    });
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    const scale = Math.min(1, target / Math.max(w, h));
+    let out = state.file;
+    if (scale < 1 || state.file.size > 1.2e6) {
+      const cw = Math.max(1, Math.round(w * scale));
+      const chh = Math.max(1, Math.round(h * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = cw; canvas.height = chh;
+      canvas.getContext('2d').drawImage(img, 0, 0, cw, chh);
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.88));
+      if (blob) {
+        out = new File([blob], 'photo.jpg', { type: 'image/jpeg' });
+        const before = (state.file.size / 1024).toFixed(0);
+        const after = (out.size / 1024).toFixed(0);
+        if (state.file.size - out.size > 200 * 1024) {
+          toast(`已压缩上传：${before}KB → ${after}KB（${cw}×${chh}）`);
+        }
+      }
+    }
+    state.upCache = { key, blob: out };
+    return out;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function buildForm(parts) {
+  const fd = new FormData();
+  fd.append('image', await prepareUpload());
+  fd.append('h', state.size.h);
+  fd.append('w', state.size.w);
+  fd.append('bg', state.bg);
+  fd.append('face_align', $('#align').checked ? 1 : 0);
+  fd.append('whitening', $('#whitening').value);
+  fd.append('brightness', $('#brightness').value);
+  fd.append('contrast', $('#contrast').value);
+  fd.append('saturation', $('#saturation').value);
+  fd.append('sharpen', $('#sharpen').value);
+  fd.append('matting_model', $('#matting').value);
+  fd.append('parts', parts);
+  return fd;
+}
+
+function render(d) {
+  state.data = {};
+  state.base = `${state.size.name}_${state.bgName}`;
+  TABS.forEach(t => { if (d[t.k]) state.data[t.k] = d[t.k]; });
+  state.idx = 0;
+  paintTabs();
   $('#result').hidden = false;
   show();
   const ms = d.ms || {};
   $('#meta').textContent =
-    `尺寸 ${state.size.w}×${state.size.h}px（300dpi）· 底色 ${state.bgName} · 推理 ${(ms.infer || 0) / 1000}s`;
+    `尺寸 ${state.size.w}×${state.size.h}px（300dpi）· 底色 ${state.bgName}` +
+    (ms.infer ? ` · 推理 ${(ms.infer / 1000).toFixed(1)}s` : '');
   $('#result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+function paintTabs() {
+  const tabs = $('#tabs');
+  tabs.innerHTML = '';
+  TABS.forEach((t) => {
+    const has = !!state.data[t.k];
+    const b = document.createElement('button');
+    b.className = 'tab';
+    b.textContent = has ? t.n : t.n + ' +';
+    b.title = has ? '' : '需要时再生成（省流量）';
+    b.setAttribute('aria-pressed', state.idx === TABS.indexOf(t) ? 'true' : 'false');
+    b.onclick = () => pick(TABS.indexOf(t));
+    tabs.appendChild(b);
+  });
+}
+
+async function pick(i) {
+  const t = TABS[i];
+  state.idx = i;
+  if (!state.data[t.k]) {
+    toast('正在生成' + t.n + '…');
+    paintTabs();
+    try {
+      const r = await fetch(api('/api/generate'), { method: 'POST', body: await buildForm(t.k) });
+      const d = await r.json();
+      if (!d.status) throw new Error(d.message || '生成失败');
+      if (d[t.k]) state.data[t.k] = d[t.k];
+      else throw new Error('服务端没有返回' + t.n);
+    } catch (e) {
+      toast(e.message, true);
+      state.idx = 0;
+    }
+  }
+  paintTabs();
+  show();
+}
+
 function show() {
-  const it = state.results[state.idx];
-  if (!it) return;
-  $('#out').src = it.data;
-  [...$('#tabs').children].forEach((c, i) => c.setAttribute('aria-pressed', i === state.idx ? 'true' : 'false'));
-  $('#dl').href = it.data;
-  $('#dl').download = `${it.base}_${it.n}.png`;
+  const t = TABS[state.idx];
+  const data = state.data[t.k];
+  if (!data) return;
+  $('#out').src = data;
+  $('#dl').href = data;
+  $('#dl').download = `${state.base}_${t.n}.${t.ext}`;
 }
 
 function saveDataUrl(url, filename) {
@@ -249,9 +332,16 @@ function saveDataUrl(url, filename) {
   document.body.appendChild(a); a.click(); a.remove();
 }
 
-$('#dlall').onclick = () => {
-  if (!state.results.length) return toast('还没有结果', true);
-  state.results.forEach((it, i) => setTimeout(() => saveDataUrl(it.data, `${it.base}_${it.n}.png`), i * 400));
+$('#dlall').onclick = async () => {
+  const keys = Object.keys(state.data);
+  if (!keys.length) return toast('还没有结果', true);
+  for (const t of TABS) {
+    if (state.data[t.k]) continue;
+    await pick(TABS.indexOf(t));
+  }
+  TABS.forEach((t, i) => {
+    if (state.data[t.k]) setTimeout(() => saveDataUrl(state.data[t.k], `${state.base}_${t.n}.${t.ext}`), i * 400);
+  });
   toast('正在保存全部图片');
 };
 
