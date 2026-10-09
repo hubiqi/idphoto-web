@@ -15,10 +15,17 @@
  */
 const $ = (s) => document.querySelector(s);
 const DIRECT = 'http://158.178.244.142:8099';
+const REPO = 'hubiqi/idphoto-web';
+// 配置来源按「新鲜度」排序，全部并行拉，谁先成功用谁：
+//   1. GitHub Contents API —— 直读仓库，CDN 只缓存 60s，且允许跨域（首选）
+//   2. raw.githubusercontent —— 同一份文件，但 CDN 最多滞后 5 分钟
+//   3. GitHub Pages —— 仓库变更后约 1 分钟生效
+//   4. Cloudflare Pages —— 部署时的快照，最旧，纯兜底
 const CONFIGS = [
-  'https://raw.githubusercontent.com/hubiqi/idphoto-web/main/api.json',
-  'https://hubiqi.github.io/idphoto-web/api.json',
-  'https://hubiqi-idphoto.pages.dev/api.json',
+  { url: `https://api.github.com/repos/${REPO}/contents/api.json`, gh: true },
+  { url: `https://raw.githubusercontent.com/${REPO}/main/api.json` },
+  { url: `https://hubiqi.github.io/idphoto-web/api.json` },
+  { url: `https://hubiqi-idphoto.pages.dev/api.json` },
 ];
 let API = '';
 
@@ -62,12 +69,25 @@ function setApi(base) {
   try { localStorage.setItem('idphoto_api', API); } catch (e) {}
 }
 
-async function fetchCfg(url, ms = 5000) {
+function b64Json(b64) {
+  try {
+    const bin = atob((b64 || '').replace(/\s/g, ''));
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return JSON.parse(new TextDecoder().decode(arr));
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchCfg(src, ms = 5000) {
   const t = withTimeout(ms);
   try {
-    const r = await fetch(url + '?t=' + Date.now(), { signal: t.signal, cache: 'no-store' });
+    const r = await fetch(src.url + (src.url.includes('?') ? '&' : '?') + 't=' + Date.now(),
+                          { signal: t.signal, cache: 'no-store' });
     if (!r.ok) return '';
-    const cfg = await r.json();
+    const j = await r.json();
+    const cfg = src.gh ? b64Json(j && j.content) : j;
     return cfg && cfg.api ? norm(cfg.api) : '';
   } catch (e) {
     return '';
